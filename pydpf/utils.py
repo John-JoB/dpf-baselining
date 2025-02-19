@@ -1,29 +1,30 @@
 import torch
-from typing import Tuple
+from typing import Tuple, Callable
 from types import FunctionType
 from functools import update_wrapper
+
+from warnings import warn
 from torch import Tensor
-from types import CodeType
 
 
-def batched_select(tensor: Tensor, index: Tensor) -> Tensor:
+def batched_select(tensor: Tensor, index: torch.LongTensor) -> Tensor:
     """
     Batched analog to tensor[index].
     Use to select along the mth dimension of tensor.
-    index has m dimensions , tensor has n dimensions.
-    m <= n
+    index has a dimensions , tensor has b dimensions.
+    a <= b
     The size of the every dimension but the last of index must be the same as the corresponding dimension in tensor.
 
     Parameters
     ----------
-    tensor : A1 x A2 X ... Am x B1 x B2 X ... X Bn Tensor
+    tensor : A1 x A2 X ... Am x I x B1 X ... X Bn Tensor
         tensor to select from
     index : A1 x A2 x A3 X ... X Am X D torch.LongTensor
         tensor of indices to select from tensor A1.
 
     Returns
     -------
-    output : A1 x A2 X ... X Am X D X B2 X ... X Bn Tensor
+    output : A1 x A2 X ... X Am X D X B1 X ... X Bn Tensor
     """
     if tensor.dim() == 3 and index.dim() == 2:
         #Special case common case for efficiency
@@ -33,10 +34,51 @@ def batched_select(tensor: Tensor, index: Tensor) -> Tensor:
     elif tensor.dim() > index.dim():
         index_size = index.size()
         index_dim = index.dim()
-        index = index.view((*index_size, *tuple([1 for _ in range(tensor.dim() - index_dim)])))
+        index = multiple_unsqueeze(index, tensor.dim() - index_dim)
         index = index.expand(*index_size,*tuple([tensor.size(i) for i in range(index_dim, tensor.dim())]))
         return torch.gather(input =tensor, index=index, dim=index_dim-1)
     raise ValueError('index cannot have more dimensions than tensor')
+
+def back_index_reduce(tensor: Tensor, index:torch.LongTensor, default_value:torch.Tensor | float = 0., min_entries: int = 0, reduction = 'sum') -> Tensor:
+    """
+        Acts in the reverse direction to batched_select, applies a reduction over all elements in tensor with the same index.
+        Use to select along the mth dimension of tensor.
+        index has a dimensions , tensor has b dimensions.
+        a <= b
+        The size of the every dimension but the last of index must be the same as the corresponding dimension in tensor.
+
+        Parameters
+        ----------
+        tensor : A1 x A2 X ... Am x D x  B1 x B2 X ... X Bn Tensor
+            tensor to select from
+        index : A1 x A2 x A3 X ... X Am X D torch.LongTensor
+            tensor of indices to select from tensor A1.
+        default_value : float | Tensor
+            Default: 0. The default value to use for indices in output that are not present in the index. If default_value is a Tensor, it's size must be exactly equal to the output size
+        min_entries : int
+            Default: 0. The size of the indexed dimension in the output will always be the maximum of min_entries and the maximum value in index.
+        reduction : str
+            Default: 'sum'. The reduction to use, possible options are 'sum', 'prod', 'mean', 'amax', 'amin'.
+
+        Returns
+        -------
+        output : A1 x A2 X ... X Am X I X B1 X ... X Bn Tensor
+    """
+    index_dim = index.dim()
+    index_size = index.size()
+    entries = torch.max(index).item()
+    if min_entries is not None:
+        entries = max(entries, min_entries)
+    if entries != index_size[-1]:
+        warn('Warning: backward pass only implemented if index has the same dimension as the output.\nConsider setting min_entries')
+    if not isinstance(default_value, torch.Tensor):
+        output = torch.full(size=(*tuple(index.size(i) for i in range(0, index_dim-1)), entries, *tuple(tensor.size(j) for j in range(index_dim, tensor.dim()))), fill_value=default_value, dtype=tensor.dtype, device=tensor.device)
+    else:
+        output = default_value
+    index = multiple_unsqueeze(index, tensor.dim() - index_dim)
+    index = index.expand(tensor.size())
+    return torch.scatter_reduce(output, dim=index_dim-1, index=index, src=tensor, reduce=reduction, include_self=False)
+
 
 
 def normalise(tensor: Tensor, dim: int = -1) -> Tuple[Tensor, Tensor]:

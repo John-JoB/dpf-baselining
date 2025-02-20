@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Union, Dict
 from .custom_types import Resampler, ImportanceKernel, ImportanceSampler
 import torch
 from torch import Tensor
@@ -69,7 +69,7 @@ class SIS(Module):
         """
         super().__init__()
         if initial_proposal is not None:
-            self._register_modules(initial_proposal, proposal)
+            self._register_functions(initial_proposal, proposal)
 
 
     def _register_functions(self, initial_proposal: Callable, proposal: Callable):
@@ -86,7 +86,7 @@ class SIS(Module):
             time_dict['series_metadata'] = data['series_metadata']
         return time_dict
 
-    def forward(self, n_particles: int, time_extent: int, aggregation_function: Callable, observation, *, gradient_regulariser: torch.autograd.Function = None, ground_truth = None, control = None, time = None, series_metadata = None) -> Tensor:
+    def forward(self, n_particles: int, time_extent: int, aggregation_function: Union[Dict[str, Module], Module], observation, *, gradient_regulariser: torch.autograd.Function = None, ground_truth = None, control = None, time = None, series_metadata = None) -> Tensor:
         """
         Run a forward pass of the SIS filter. To save memory during inference runs we allow the user to pass a function that takes a population
         of particles and processes this into an output for each time-step. For example, if the goal was the filtering mean then it would be
@@ -99,18 +99,27 @@ class SIS(Module):
             The number of particles to draw per filter.
         time_extent: int
             The maximum time-step to run to, including time 0, the filter will draw {time_extent + 1} importance sample populations.
-        aggregation_function: Aggregation
-            A Callable that processes the filtering outputs (the particle locations, the normalised log weights,
+        aggregation_function: Union[Dict[str, Module], Module]
+            A module that's forward function processes the filtering outputs (the particle locations, the normalised log weights,
             the log sum of the unormalised weights, the data, the time-step) into an output per time-step.
+            Or a string indexed dictionary of such items.
         data: Tensor
             The data needed to run the filter
 
         Returns
         -------
-        output: Tensor
+        output: Tensor or Dict[str, Tensor]
             The output of the filter, formed from stacking the output of aggregation_function for every time-step.
+            Or if aggregation_function is a dictionary, a dictionary of these output Tensors one for each aggregation function.
         """
-        #Register any parameters
+        #Register module should the aggregation function have learnable parameters
+        if isinstance(aggregation_function,dict):
+            self.aggregation_function = torch.nn.ModuleDict(aggregation_function)
+            output_dict = True
+        else:
+            self.aggregation_function = aggregation_function
+            output_dict = False
+
         if self.training or not torch.is_grad_enabled():
             gradient_regulariser = None
         gt_exists = False
@@ -118,27 +127,45 @@ class SIS(Module):
             gt_exists = True
         time_data = self._get_time_data(0, observation = observation, control = control, time = time, series_metadata = series_metadata)
         state, weight, likelihood = self.initial_proposal(n_particles = n_particles, **time_data)
-        if gt_exists:
-            temp = aggregation_function(state = state, weight = weight, likelihood = likelihood, ground_truth = ground_truth[0], **time_data)
+
+        if output_dict:
+            output = {}
+            for name, function in aggregation_function.items():
+                if gt_exists:
+                    temp = function(state=state, weight=weight, likelihood=likelihood, ground_truth=ground_truth[0], **time_data)
+                else:
+                    temp = function(state=state, weight=weight, likelihood=likelihood, **time_data)
+                output[name] = torch.empty((time_extent+1, *temp.size()), device = observation.device, dtype=torch.float32)
+                output[name][0] = temp
         else:
-            temp = aggregation_function(state = state, weight = weight, likelihood = likelihood, **time_data)
-        output = torch.empty((time_extent+1, *temp.size()), device = observation.device, dtype=torch.float32)
-        output[0] = temp
+            if gt_exists:
+                temp = aggregation_function(state = state, weight = weight, likelihood = likelihood, ground_truth = ground_truth[0], **time_data)
+            else:
+                temp = aggregation_function(state = state, weight = weight, likelihood = likelihood, **time_data)
+            output = torch.empty((time_extent+1, *temp.size()), device = observation.device, dtype=torch.float32)
+            output[0] = temp
         for t in range(1, time_extent+1):
             try:
-                time_data = self._get_time_data(t, observation=observation, control=control, time=time, series_metadata=series_metadata)
+                time_data = self._get_time_data(t, observation = observation, control = control, time = time, series_metadata = series_metadata)
                 prev_state = state
                 prev_weight = weight
-                state, weight, likelihood = self.proposal(prev_state=state, prev_weight=weight, **time_data)
+                state, weight, likelihood = self.proposal(prev_state = state, prev_weight = weight, **time_data)
                 if not gradient_regulariser is None:
-                    state, weight = gradient_regulariser(state=state, weight=weight, prev_state=prev_state, prev_weight=prev_weight)
-                if gt_exists:
-                    output[t] = aggregation_function(state=state, weight=weight, likelihood=likelihood, ground_truth=ground_truth[t], **time_data)
+                    state, weight = gradient_regulariser(state = state, weight = weight, prev_state= prev_state, prev_weight = prev_weight)
+                if output_dict:
+                    for name, function in aggregation_function.items():
+                        if gt_exists:
+                            output[name][t] = function(state=state, weight=weight, likelihood=likelihood, ground_truth=ground_truth[t], **time_data)
+                        else:
+                            output[name][t] = function(state=state, weight=weight, **time_data)
                 else:
-                    output[t] = aggregation_function(state=state, weight=weight, **time_data)
+                    if gt_exists:
+                        output[t] = aggregation_function(state=state, weight=weight, likelihood=likelihood, ground_truth = ground_truth[t], **time_data)
+                    else:
+                        output[t] = aggregation_function(state=state, weight=weight, **time_data)
             except DivergenceError as e:
                 warn(f'Detected divergence at time-step {t} with message:\n    {e} \nStopping iteration early.')
-                return output[:t - 1]
+                return output[:t-1]
         return output
 
 
@@ -147,7 +174,7 @@ class ParticleFilter(SIS):
         Helper class for a common case of the SIS, the particle filter (Doucet and Johansen 2008), (Chopin and Papaspiliopoulos 2020).
         Applies a resampling step prior to sampling from the proposal kernel.
     """
-    def __init__(self, resampler: Resampler = None, SSM: FilteringModel = None, use_REINFORCE_for_proposal:bool = False) -> None:
+    def __init__(self, resampler: Resampler = None, SSM: FilteringModel = None, use_REINFORCE:bool = False) -> None:
         """
         The standard particle filter is a special case of the SIS algorithm. We construct the particle filtering proposal by first
         resampling particles from their population, then applying a proposal kernel restricted such that the particles depend only on the
@@ -167,7 +194,7 @@ class ParticleFilter(SIS):
             Whether to use the REINFORCE estimator for the gradient due to the particle proposal process. Applying REINFORCE to only some components of the
             state space is not permitted with this API, such a use case would require a custom SIS process.
         """
-        self.REINFORCE = use_REINFORCE_for_proposal
+        self.REINFORCE = use_REINFORCE
 
         super().__init__()
         if resampler is not None:
@@ -198,16 +225,16 @@ class ParticleFilter(SIS):
         else:
             if self.REINFORCE:
                 def prior(n_particles, observation, **data):
-                    state = self.initial_proposal_model.sample(batch_size = observation.size(0), n_particles = n_particles, **data)
+                    state = self.initial_proposal_model.sample(batch_size = observation.size(0), n_particles = n_particles, **data).detach()
                     weight = (self.SSM.observation_model.score(state = state, observation = observation, **data)
-                              - self.SSM.initial_proposal_model.log_density(state = state, observation = observation, **data)
+                              - self.SSM.initial_proposal_model.log_density(state = state, observation = observation, **data).detach()
                               + self.SSM.prior_model.log_density(state = state, **data))
                     return state, weight
             else:
                 def prior(n_particles, observation, **data):
-                    state = self.initial_proposal_model.sample(batch_size = observation.size(0), n_particles = n_particles, **data).detach()
+                    state = self.initial_proposal_model.sample(batch_size = observation.size(0), n_particles = n_particles, **data)
                     weight = (self.SSM.observation_model.score(state = state, observation = observation, **data)
-                              - self.SSM.initial_proposal_model.log_density(state = state, observation = observation, **data).detach()
+                              - self.SSM.initial_proposal_model.log_density(state = state, observation = observation, **data)
                               + self.SSM.prior_model.log_density(state = state, **data))
                     return state, weight
 
@@ -267,9 +294,9 @@ class ParticleFilter(SIS):
 
 
 class MarginalParticleFilter(SIS):
-    def __init__(self, resampler: Resampler = None, SSM: FilteringModel = None, use_REINFORCE_for_proposal:bool = False):
+    def __init__(self, resampler: Resampler = None, SSM: FilteringModel = None, REINFORCE_method:str = 'none'):
         super().__init__()
-        self.REINFORCE = use_REINFORCE_for_proposal
+        self.REINFORCE = REINFORCE_method
 
 
         super().__init__()
@@ -282,15 +309,30 @@ class MarginalParticleFilter(SIS):
         self.resampler = resampler
         self.SSM = SSM
 
-        if self.REINFORCE:
+        if self.REINFORCE == 'full':
             if not hasattr(SSM.prior_model, 'log_density'):
-                raise AttributeError("The prior model must implement a 'log_density' method for REINFORCE.")
+                raise AttributeError("The prior model must implement a 'log_density' method for full REINFORCE.")
 
         if not hasattr(SSM.dynamic_model, 'log_density'):
             raise AttributeError("The dynamic model must implement a 'log_density' method for the marginal particle filter.")
 
+        identity = lambda x: x
+        detach_fun = lambda x: x.detach()
+
+        detach_full = identity
+        detach_partial = identity
+
+        if self.REINFORCE not in ['full', 'partial', 'none']:
+            raise ValueError("Parameter REINFORCE_method must be 'full', 'partial' or 'none'.")
+
+        if self.REINFORCE == "full":
+            detach_full = detach_fun
+        if self.REINFORCE == "partial":
+            detach_partial = detach_fun
+
+
         if self.SSM.initial_proposal_model is None:
-            if self.REINFORCE:
+            if self.REINFORCE == 'full':
                 def prior(n_particles, observation, **data):
                     state = self.SSM.prior_model.sample(batch_size = observation.size(0), n_particles = n_particles, **data).detach()
                     density = self.SSM.prior_model.log_density(state = state, **data)
@@ -302,29 +344,21 @@ class MarginalParticleFilter(SIS):
                     weight = self.SSM.observation_model.score(state = state, observation = observation, **data)
                     return state, weight
         else:
-            if self.REINFORCE:
-                def prior(n_particles, observation, **data):
-                    state = self.initial_proposal_model.sample(batch_size = observation.size(0), n_particles = n_particles, **data)
-                    weight = (self.SSM.observation_model.score(state = state, observation = observation, **data)
-                              - self.SSM.initial_proposal_model.log_density(state = state, observation = observation, **data)
-                              + self.SSM.prior_model.log_density(state = state, **data))
-                    return state, weight
-            else:
-                def prior(n_particles, observation, **data):
-                    state = self.initial_proposal_model.sample(batch_size = observation.size(0), n_particles = n_particles, **data).detach()
-                    weight = (self.SSM.observation_model.score(state = state, observation = observation, **data)
-                              - self.SSM.initial_proposal_model.log_density(state = state, observation = observation, **data).detach()
-                              + self.SSM.prior_model.log_density(state = state, **data))
-                    return state, weight
+            def prior(n_particles, observation, **data):
+                state = detach_full(self.initial_proposal_model.sample(batch_size = observation.size(0), n_particles = n_particles, **data))
+                weight = (self.SSM.observation_model.score(state = state, observation = observation, **data)
+                          - detach_full(self.SSM.initial_proposal_model.log_density(state = state, observation = observation, **data))
+                          + self.SSM.prior_model.log_density(state = state, **data))
+                return state, weight
 
         def initial_sampler(n_particles: int, **data):
             state, weight = prior(n_particles=n_particles, **data)
             weight, likelihood = normalise(weight)
             return state, weight, likelihood
 
-        detach_if_reinforce = lambda x: x
-        if self.REINFORCE:
-            detach_if_reinforce = lambda x: x.detach()
+
+
+
 
         if self.SSM.proposal_model is None:
             def prop(prev_state, prev_weight, observation, **data):
@@ -334,22 +368,22 @@ class MarginalParticleFilter(SIS):
                 expanded_prev_state = prev_state.unsqueeze(1).expand(-1, state.size(1), -1, -1).flatten(1, 2)
                 expanded_state = state.unsqueeze(2).expand(-1, -1, state.size(1), -1).flatten(1, 2)
                 dynamic_log_density = self.SSM.dynamic_model.log_density(state=expanded_state, prev_state=expanded_prev_state, **data).reshape(state.size(0), state.size(1), state.size(1))
-                weight = (torch.logsumexp(prev_weight.unsqueeze(1) + dynamic_log_density, dim=-1)
-                          - detach_if_reinforce(torch.logsumexp(used_weight.unsqueeze(1) + dynamic_log_density, dim=-1))
-                          + self.SSM.observation_model.score(state=state, observation=observation, **data)) + resampled_weight
+                weight = (torch.logsumexp(prev_weight.unsqueeze(1) + detach_partial(dynamic_log_density), dim=-1)
+                          - detach_full(detach_partial(torch.logsumexp(used_weight.unsqueeze(1) + dynamic_log_density, dim=-1)))
+                          + self.SSM.observation_model.score(state=state, observation=observation, **data))
                 return state, weight, resampled_weight, dynamic_log_density, dynamic_log_density
         else:
             def prop(prev_state, prev_weight, observation, **data):
                 resampled_state, resampled_weight = self.resampler(prev_state, prev_weight, **data)
-                state = self.SSM.proposal_model.sample(prev_state=resampled_state, **data)
+                state = detach_full(self.SSM.proposal_model.sample(prev_state=resampled_state, **data))
                 used_weight = self.resampler.cache['used_weight']
                 expanded_prev_state = prev_state.unsqueeze(1).expand(-1, state.size(1), -1, -1).flatten(1, 2)
                 expanded_state = state.unsqueeze(2).expand(-1, -1, state.size(1), -1).flatten(1, 2)
                 dynamic_log_density = self.SSM.dynamic_model.log_density(state=expanded_state, prev_state=expanded_prev_state, **data).reshape(state.size(0), state.size(1), state.size(1))
                 proposal_log_density = self.SSM.proposal_model.log_density(state=expanded_state, prev_state=expanded_prev_state, **data).reshape(state.size(0), state.size(1), state.size(1))
                 weight = (torch.logsumexp(prev_weight.unsqueeze(1) + dynamic_log_density, dim=-1)
-                          - torch.logsumexp(used_weight.unsqueeze(1) + proposal_log_density, dim=-1)
-                          + self.SSM.observation_model.score(state=state, observation=observation, **data)) + resampled_weight
+                          - detach_full(torch.logsumexp(used_weight.unsqueeze(1) + proposal_log_density, dim=-1))
+                          + self.SSM.observation_model.score(state=state, observation=observation, **data))
                 return state, weight, resampled_weight, dynamic_log_density, proposal_log_density
 
         if isinstance(self.resampler, ConditionalResampler):
@@ -432,9 +466,9 @@ class MarginalDPF(MarginalParticleFilter):
             The generator to track the resampling rng.
         """
         if multinomial:
-            super().__init__(MultinomialResampler(resampling_generator), SSM, False)
+            super().__init__(MultinomialResampler(resampling_generator), SSM, 'none')
         else:
-            super().__init__(SystematicResampler(resampling_generator), SSM, False)
+            super().__init__(SystematicResampler(resampling_generator), SSM, 'none')
 
         temp = copy(self.proposal)
         self.proposal = lambda prev_state, prev_weight, **data: temp(prev_state.detach(), prev_weight.detach(), **data)
@@ -499,9 +533,9 @@ class MarginalStraightThroughDPF(MarginalParticleFilter):
             The generator to track the resampling rng.
         """
         if multinomial:
-            super().__init__(MultinomialResampler(resampling_generator), SSM, False)
+            super().__init__(MultinomialResampler(resampling_generator), SSM, 'none')
         else:
-            super().__init__(SystematicResampler(resampling_generator), SSM, False)
+            super().__init__(SystematicResampler(resampling_generator), SSM, 'none')
 
 
 class SoftDPF(ParticleFilter):
@@ -548,7 +582,7 @@ class MarginalSoftDPF(MarginalParticleFilter):
                  resampling_generator: torch.Generator = torch.default_generator,
                  multinomial: bool = False) -> None:
         """
-        Differentiable particle filter with soft-resampling.
+        Differentiable marginal particle filter with soft-resampling.
 
         Parameters
         ----------
@@ -644,7 +678,7 @@ class MarginalStopGradientDPF(MarginalParticleFilter):
                  resampling_generator: torch.Generator = torch.default_generator,
                  multinomial = False) -> None:
         """
-        Differentiable particle filter with stop-gradient resampling.
+        Differentiable particle filter with marginalised stop-gradient resampling.
 
         Parameters
         ----------
@@ -658,11 +692,47 @@ class MarginalStopGradientDPF(MarginalParticleFilter):
             Importance sampler for the proposal kernel, takes the state, weights and data and returns the new states and weights.
         resampling_generator:
             The generator to track the resampling rng.
+
+        Warnings
+        ---------
+        In the current implementation, this filter is the only case where taking an SSM with a null proposal is not equivalent to the using the same module for both the proposal
+        and dynamic models. This is because a partially reparameterised estimator exists for the bootstrap case but not with a generic proposal. If SSM has a non-null proposal
+        then this algorithm is exactly equivalent to the REINFORCEDPF.
         """
         if multinomial:
-            super().__init__(MultinomialResampler(resampling_generator), SSM, True)
+            super().__init__(MultinomialResampler(resampling_generator), SSM, 'partial')
             return
-        super().__init__(SystematicResampler(resampling_generator), SSM, True)
+        super().__init__(SystematicResampler(resampling_generator), SSM, 'partial')
+
+class REINFORCEDPF(MarginalParticleFilter):
+    def __init__(self, SSM: FilteringModel = None,
+                 resampling_generator: torch.Generator = torch.default_generator,
+                 multinomial = False) -> None:
+        """
+        Differentiable particle filter with marginalised stop-gradient resampling.
+
+        Parameters
+        ----------
+        SSM: FilteringModel
+            A FilteringModel that represents the SSM (and optionally a proposal model). See the documentation of FilteringModel for more complete information.
+            If this parameter is not None then the values of initial_proposal and proposal are ignored.
+        initial_proposal: ImportanceSampler
+            Importance sampler for the initial distribution, takes the number of particles and the data at time 0,
+            and returns the importance sampled state and weights
+        proposal: ImportanceKernel
+            Importance sampler for the proposal kernel, takes the state, weights and data and returns the new states and weights.
+        resampling_generator:
+            The generator to track the resampling rng.
+
+        Warnings
+        ---------
+        In the current implementation, this filter is the only case where taking an SSM with a null proposal is not equivalent to the bootstrap formulation.
+        """
+        if multinomial:
+            super().__init__(MultinomialResampler(resampling_generator), SSM, 'full')
+            return
+        super().__init__(SystematicResampler(resampling_generator), SSM, 'full')
+
 
 class KernelDPF(ParticleFilter):
 

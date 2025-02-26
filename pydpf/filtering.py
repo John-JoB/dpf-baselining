@@ -12,6 +12,7 @@ from warnings import warn
 from .conditional_resampling import ConditionalResampler
 from copy import copy
 
+
 """
 Python module for the core filtering algorithms. 
 
@@ -80,6 +81,7 @@ class SIS(Module):
     @staticmethod
     def _get_time_data(t: int, **data: dict, ) -> dict:
         time_dict = {k:v[t] for k, v in data.items() if k != 'series_metadata' and k != 'state' and v is not None}
+        time_dict['t'] = t
         if data['time'] is not None and t>0:
             time_dict['prev_time'] = data['time'][t-1]
         if data['series_metadata'] is not None:
@@ -253,14 +255,14 @@ class ParticleFilter(SIS):
         else:
             if self.REINFORCE:
                 def prop(prev_state, prev_weight, observation, **data):
-                    new_state = self.SSM.dynamic_model.sample(prev_state = prev_state, **data).detach()
+                    new_state = self.SSM.proposal_model.sample(prev_state = prev_state, **data).detach()
                     new_weight = (prev_weight + self.SSM.observation_model.score(state = new_state, observation = observation, **data)
                                   - self.SSM.proposal_model.log_density(state = new_state, prev_state = prev_state, observation = observation, **data).detach()
                                   + self.SSM.dynamic_model.log_density(state = new_state, prev_state = prev_state, **data))
                     return new_state, new_weight
             else:
                 def prop(prev_state, prev_weight, observation, **data):
-                    new_state = self.SSM.dynamic_model.sample(prev_state = prev_state, **data)
+                    new_state = self.SSM.proposal_model.sample(prev_state = prev_state, **data)
                     new_weight = (prev_weight + self.SSM.observation_model.score(state = new_state, observation = observation, **data)
                                   - self.SSM.proposal_model.log_density(state = new_state, prev_state = prev_state, observation = observation, **data)
                                   + self.SSM.dynamic_model.log_density(state = new_state, prev_state = prev_state, **data))
@@ -503,7 +505,6 @@ class StraightThroughDPF(ParticleFilter):
             super().__init__(MultinomialResampler(resampling_generator), SSM, False)
         else:
             super().__init__(SystematicResampler(resampling_generator), SSM, False)
-
 
 
 class MarginalStraightThroughDPF(MarginalParticleFilter):

@@ -1,3 +1,4 @@
+
 import pydpf
 import torch
 from typing import Union
@@ -41,7 +42,7 @@ class HestonDynamic(pydpf.Module):
         self.sigma_ = sigma
         if self.sigma_ is None:
             self.sigma_ = torch.nn.Parameter(torch.rand(1, device = self.device, generator = generator)*1e-2, requires_grad=True)
-        self.dist = pydpf.distributions.MultivariateGaussian(torch.tensor([1], device=self.device), cholesky_covariance=torch.tensor([[1]], device=self.device), generator=self.generator)
+        self.dist = pydpf.distributions.MultivariateGaussian(torch.tensor([0], device=self.device), cholesky_covariance=torch.tensor([[1]], device=self.device), generator=self.generator)
 
     def sample(self, prev_state, time, prev_time, **data):
         #Only allow one Euler-Maruyama step per time-step to keep the densities tractable.
@@ -73,12 +74,17 @@ class HestonMeasurement(pydpf.Module):
     def __init__(self, dynamic:HestonDynamic, r:Tensor = None, rho:Tensor = None, generator = torch.default_generator):
         super().__init__()
         self.device = dynamic.device
+        self.generator = generator
         self.r_ = r
         if self.r_ is None:
             self.r_ = torch.nn.Parameter(torch.rand(1, device = self.device, generator = generator)*1e-3, requires_grad=True)
         self.rho_ = rho
         if self.rho_ is None:
             self.rho_ = torch.nn.Parameter(torch.rand(1, device = self.device, generator = generator)*2 - 1, requires_grad=True)
+        self.sigma = dynamic.sigma
+        self.k = dynamic.k
+        self.theta = dynamic.theta
+        self.dist = pydpf.distributions.MultivariateGaussian(torch.tensor([0], device=self.device), cholesky_covariance=torch.tensor([[1]], device=self.device), generator=self.generator)
 
     @constrained_parameter
     def rho(self):
@@ -87,3 +93,15 @@ class HestonMeasurement(pydpf.Module):
     @constrained_parameter
     def r(self):
         return self.r_, torch.abs(self.r_)
+
+    def score(self, state, time, prev_time, observation, t, **data):
+        if t == 0:
+            #Return not defined for first time-step, so just assign all particles the same weight
+            return torch.zeros((observation.size(0), state.size(1)), device=self.device, dtype=torch.float32)
+        time_delta = time - prev_time
+        prev_volatility = torch.exp(-state[:, :, 1])
+        independent_mean = (self.r - (1/(2*prev_volatility)))*time_delta
+        dependent_correction = (1/(self.sigma*prev_volatility)) * (state[:,:,0] - state[:,:,1] - (self.k * (self.theta*prev_volatility - 1) - (prev_volatility*(self.sigma**2)/2))*time_delta)
+        zero_mean_obs = observation - independent_mean - dependent_correction
+        sd = torch.sqrt(time_delta/prev_volatility)
+        return self.dist.log_prob(zero_mean_obs/sd)

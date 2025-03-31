@@ -134,8 +134,31 @@ def multiple_unsqueeze(tensor: Tensor, n: int, dim: int = -1) -> Tensor:
     if n == 0:
         return tensor
     if dim < 0:
-        dim = tensor.dim() + dim
+        dim = tensor.dim() + dim + 1
     return tensor[(slice(None),) * dim + (None, ) * n]
+
+def match_dims(A: Tensor, B: Tensor) -> Tensor:
+    """
+    Outputs a Tensor that is Tensor A with size 1 dimensions added to match Tensor B.
+
+    Parameters
+    ----------
+    A:Tensor:
+        Tensor to unsqueeze.
+
+    B:Tensor
+        Tensor to match dimensions.
+
+    Returns
+    -------
+        output : Tensor
+            A unsqueeezed to the size of Tensor B.
+    """
+    if B.dim() < A.dim():
+        raise ValueError('Tensor B must have at least as many dimensions as A.')
+    if B.dim() == A.dim():
+        return A
+    return multiple_unsqueeze(A, B.dim() - A.dim(), -1)
 
 
 class doc_function:

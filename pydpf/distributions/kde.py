@@ -1,8 +1,10 @@
 from .base import Distribution
-from torch import Tensor
+from torch import Tensor, dtype
 from .Gaussian import MultivariateGaussian
 from typing import Iterable, Union, Tuple, List
 import torch
+
+from .delta import DeltaMeasure
 from ..utils import doc_function, batched_select
 from ..resampling import MultinomialResampler
 
@@ -106,10 +108,12 @@ class KernelMixture(Distribution):
     conditional = True
 
     def make_kernel(self, kernel: str, dim: int) -> Distribution:
-        if not kernel == 'Gaussian':
-            raise NotImplementedError('Only Gaussian kernels are implemented for automatic generation.')
-        cov = torch.nn.Parameter(torch.eye(dim, device=self.generator.device) * torch.rand(dim, device=self.generator.device, generator=self.generator))
-        return MultivariateGaussian(torch.zeros(dim, device=self.generator.device), cov, generator=self.generator, gradient_estimator='none', diagonal_cov=True)
+        if kernel == 'Gaussian':
+            cov = torch.nn.Parameter(torch.eye(dim, device=self.generator.device) * torch.rand(dim, device=self.generator.device, generator=self.generator))
+            return MultivariateGaussian(torch.zeros(dim, device=self.generator.device), cov, generator=self.generator, gradient_estimator='none', diagonal_cov=True)
+        if kernel == 'Delta':
+            return DeltaMeasure(gradient_estimator='none', generator=self.generator, loc=torch.zeros((dim,), device=self.generator.device, dtype = torch.float32))
+        raise NotImplementedError('Only Gaussian and Delta kernels are implemented for automatic generation.')
 
     def __init__(self, kernel: Union[List[Tuple[str, int]]], gradient_estimator: str, generator: Union[torch.Generator, None]):
         """

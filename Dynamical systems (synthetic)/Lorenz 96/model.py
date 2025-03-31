@@ -64,7 +64,7 @@ class LorenzDynamic(pydpf.Module):
         time_gap = (time - prev_time).unsqueeze(1).unsqueeze(2)
         root_gap = torch.sqrt(time_gap)
         state_0_mean = (state - (drift * time_gap))/root_gap
-        return self.diffusion_dist.log_density(state_0_mean)
+        return self.diffusion_dist.log_density(state_0_mean) - torch.log(root_gap).squeeze(-1)
 
 class LorenzPrior(pydpf.Module):
     def __init__(self, state_dim: int, device: Union[str, torch.device] = "cpu", generator: torch.Generator = torch.default_generator):

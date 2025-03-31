@@ -395,7 +395,10 @@ class LinearGaussian(Distribution):
             @constrained_parameter
             def constrained_weight(self):
                 if constrain_spectral_radius is not None:
+                   # print('eigvals')
+                    #print(self.weight)
                     eigvals = torch.linalg.eigvals(self.weight)
+                    #print('radius')
                     spectral_radius = torch.max(torch.abs(eigvals))
                     if  spectral_radius > constrain_spectral_radius:
                         return self.weight, self.weight / spectral_radius

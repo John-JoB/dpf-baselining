@@ -115,6 +115,7 @@ class SIS(Module):
             Or if aggregation_function is a dictionary, a dictionary of these output Tensors one for each aggregation function.
         """
         #Register module should the aggregation function have learnable parameters
+        log_N = torch.log(torch.tensor(n_particles, dtype=torch.float32, device=observation.device))
         if isinstance(aggregation_function,dict):
             self.aggregation_function = torch.nn.ModuleDict(aggregation_function)
             output_dict = True
@@ -129,7 +130,7 @@ class SIS(Module):
             gt_exists = True
         time_data = self._get_time_data(0, observation = observation, control = control, time = time, series_metadata = series_metadata)
         state, weight, likelihood = self.initial_proposal(n_particles = n_particles, **time_data)
-
+        likelihood = likelihood - log_N
         if output_dict:
             output = {}
             for name, function in aggregation_function.items():
@@ -152,6 +153,7 @@ class SIS(Module):
                 prev_state = state
                 prev_weight = weight
                 state, weight, likelihood = self.proposal(prev_state = state, prev_weight = weight, **time_data)
+                likelihood = likelihood - log_N
                 if not gradient_regulariser is None:
                     state, weight = gradient_regulariser(state = state, weight = weight, prev_state= prev_state, prev_weight = prev_weight)
                 if output_dict:
@@ -159,12 +161,12 @@ class SIS(Module):
                         if gt_exists:
                             output[name][t] = function(state=state, weight=weight, likelihood=likelihood, ground_truth=ground_truth[t], **time_data)
                         else:
-                            output[name][t] = function(state=state, weight=weight, **time_data)
+                            output[name][t] = function(state=state, weight=weight,likelihood=likelihood, **time_data)
                 else:
                     if gt_exists:
                         output[t] = aggregation_function(state=state, weight=weight, likelihood=likelihood, ground_truth = ground_truth[t], **time_data)
                     else:
-                        output[t] = aggregation_function(state=state, weight=weight, **time_data)
+                        output[t] = aggregation_function(state=state, weight=weight, likelihood=likelihood, **time_data)
             except DivergenceError as e:
                 warn(f'Detected divergence at time-step {t} with message:\n    {e} \nStopping iteration early.')
                 return output[:t-1]

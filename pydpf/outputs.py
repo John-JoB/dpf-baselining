@@ -4,6 +4,8 @@ from typing import Callable, Tuple
 from .base import Module
 from .distributions import KernelMixture
 from .custom_types import ImportanceKernel
+from .model_based_api import FilteringModel
+from .filtering import SIS
 
 class FilteringMean(Module):
     def __init__(self,function: Callable[[Tensor], Tensor] = lambda x: x):
@@ -37,9 +39,6 @@ class MSE_Loss(Module):
 
     def forward(self, *, state: Tensor, weight: Tensor, ground_truth, **data):
         filter_mean = self.mean(state = state, weight = weight)
-        #print(filter_mean[0])
-        #print(ground_truth[0])
-        #print(torch.sum((ground_truth - filter_mean) ** 2, dim=-1)[0])
         return torch.mean(torch.sum((ground_truth - filter_mean) ** 2, dim=-1))
 
 class LogLikelihoodFactors(Module):
@@ -115,3 +114,31 @@ class NegLogDataLikelihood_Loss(Module):
 
     def forward(self, *, state: Tensor, weight: Tensor, ground_truth, **kwargs):
         return -self.KDE.log_density(ground_truth, state, weight)
+
+def _get_time_data(t: int, **data: dict, ) -> dict:
+    time_dict = {k:v[t] for k, v in data.items() if k != 'series_metadata' and k != 'state' and v is not None}
+    time_dict['t'] = t
+    if data['time'] is not None and t>0:
+        time_dict['prev_time'] = data['time'][t-1]
+    if data['series_metadata'] is not None:
+        time_dict['series_metadata'] = data['series_metadata']
+    return time_dict
+
+def simulate(initial_state, initial_time, SSM:FilteringModel, trajectory_length, simulate_obs = True, *, observation=None, control=None, time=None, series_metadata=None):
+    state = torch.empty((trajectory_length, *initial_state.shape), device=initial_state.device)
+    for timestep in range(initial_time, initial_time+trajectory_length):
+        data = SIS._get_time_data(timestep, observation=observation, control=control, time=time, series_metadata=series_metadata)
+        relative_t = timestep-initial_time
+        if relative_t == 0:
+            state[0] =  SSM.dynamic_model.sample(prev_state = initial_state, **data)
+            temp = SSM.observation_model.sample(state = state[0], **data)
+            if simulate_obs:
+                observation = torch.empty((trajectory_length, *temp.shape), device=initial_state.device)
+                observation[0] = temp
+            continue
+        state[relative_t] = SSM.dynamic_model.sample(prev_state = state[relative_t-1], **data)
+        if simulate_obs:
+            observation[relative_t] = SSM.observation_model.sample(state = state[relative_t], **data)
+    return state, observation
+
+

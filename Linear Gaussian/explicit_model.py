@@ -18,7 +18,7 @@ class GaussianPrior(pydpf.Module):
 
     def sample(self, batch_size:int, n_particles:int)->Tensor:
         standard_sample = torch.randn((batch_size, n_particles, self.mean.size(0)), device=self.device, generator=self.generator)
-        return transform_Gaussian_sample(standard_sample, self.mean, self.cholesky_covariance)
+        return self.mean + standard_sample @ self.cholesky_covariance.T
 
     # Constrain the cholesky_covariance to be lower-triangular with positive diagonal
     @pydpf.constrained_parameter
@@ -41,9 +41,8 @@ class LinearGaussianDynamic(pydpf.Module):
 
     def sample(self, prev_state:Tensor)->Tensor:
         standard_sample = torch.randn(prev_state.size(), device=self.device, generator=self.generator)
-        #No built-in way to do matrix vector products in pytorch :(
         mean = (self.constrained_weight @ prev_state.unsqueeze(-1)).squeeze() + self.bias
-        return transform_Gaussian_sample(standard_sample, mean, self.cholesky_covariance)
+        return self.mean + standard_sample @ self.cholesky_covariance.T
 
     #Constrain the cholesky_covariance to be lower-triangular with positive diagonal
     @pydpf.constrained_parameter
